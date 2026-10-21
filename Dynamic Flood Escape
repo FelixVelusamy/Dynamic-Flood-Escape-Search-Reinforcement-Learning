@@ -1,0 +1,769 @@
+"""Dynamic Flood Escape: compact search and RL comparison assignment."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import heapq
+import math
+import random
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+SIZE = 10
+START = (0, 0)
+GOAL = (9, 9)
+FLOOD_SOURCES = ((5, 5),)
+MAX_STEPS = 100
+ACTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+ACTION_NAMES = ("Up", "Down", "Left", "Right")
+SCENARIOS = {"static": None, "slow": 8, "normal": 4, "rapid": 3}
+REWARDS = ("basic", "shaped")
+OUTPUT_DIR = Path("outputs")
+MODEL_DIR = OUTPUT_DIR / "models"
+PLOT_DIR = OUTPUT_DIR / "plots"
+
+
+def make_walls() -> set[tuple[int, int]]:
+    """Build a sparse map with a small detour and a few harmless wall clusters."""
+    walls = {
+        (3, 2), (3, 3), (3, 4),
+        (5, 6), (5, 7), (6, 2),
+        (7, 5), (8, 5),
+    }
+    walls.discard(START)
+    walls.discard(GOAL)
+    walls.difference_update(FLOOD_SOURCES)
+    return walls
+
+
+WALLS = make_walls()
+
+
+def build_flood_distances() -> dict[tuple[int, int], int]:
+    """Shortest flood-wave distance from any source, through non-wall cells."""
+    distances = {source: 0 for source in FLOOD_SOURCES}
+    queue = deque(FLOOD_SOURCES)
+    while queue:
+        row, col = queue.popleft()
+        for dr, dc in ACTIONS:
+            cell = (row + dr, col + dc)
+            if (
+                0 <= cell[0] < SIZE
+                and 0 <= cell[1] < SIZE
+                and cell not in WALLS
+                and cell != GOAL
+                and cell not in distances
+            ):
+                distances[cell] = distances[(row, col)] + 1
+                queue.append(cell)
+    return distances
+
+
+FLOOD_DISTANCE = build_flood_distances()
+
+
+def flood_level(t: int, interval: int | None) -> int:
+    return -1 if interval is None else t // interval
+
+
+def is_flooded(cell: tuple[int, int], t: int, interval: int | None) -> bool:
+    if interval is None or cell == GOAL:
+        return False
+    distance = FLOOD_DISTANCE.get(cell)
+    return distance is not None and distance <= flood_level(t, interval)
+
+
+class FloodEscapeEnv:
+    """Small Gymnasium-compatible grid environment."""
+
+    metadata = {"render_modes": []}
+
+    def __init__(self, scenario: str, reward_mode: str = "basic"):
+        if scenario not in SCENARIOS:
+            raise ValueError(f"Unknown scenario: {scenario}")
+        if reward_mode not in REWARDS:
+            raise ValueError(f"Unknown reward mode: {reward_mode}")
+        self.scenario = scenario
+        self.interval = SCENARIOS[scenario]
+        self.reward_mode = reward_mode
+        self.max_steps = MAX_STEPS
+        self.pos = START
+        self.t = 0
+        self.done = False
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        del seed, options
+        self.pos = START
+        self.t = 0
+        self.done = False
+        return self._observation(), {"position": self.pos, "time": self.t}
+
+    def _observation(self) -> np.ndarray:
+        return np.asarray(
+            [self.pos[0] / (SIZE - 1), self.pos[1] / (SIZE - 1), self.t / self.max_steps],
+            dtype=np.float32,
+        )
+
+    def _potential(self, pos: tuple[int, int], t: int) -> float:
+        distance_to_goal = abs(pos[0] - GOAL[0]) + abs(pos[1] - GOAL[1])
+        if self.interval is None:
+            hazard_cost = 0.0
+        else:
+            active_flood = [
+                cell
+                for cell, distance in FLOOD_DISTANCE.items()
+                if distance <= flood_level(t, self.interval)
+            ]
+            nearest_flood = min(
+                (
+                    abs(pos[0] - cell[0]) + abs(pos[1] - cell[1])
+                    for cell in active_flood
+                ),
+                default=SIZE * 2,
+            )
+            hazard_cost = 2.0 / (nearest_flood + 1) if active_flood else 0.0
+        return -float(distance_to_goal) - hazard_cost
+
+    def step(self, action: int):
+        if self.done:
+            raise RuntimeError("step() called after episode termination; call reset().")
+        if not 0 <= int(action) < len(ACTIONS):
+            raise ValueError(f"Action must be in 0..{len(ACTIONS) - 1}.")
+
+        old_pos, old_t = self.pos, self.t
+        dr, dc = ACTIONS[int(action)]
+        target = (old_pos[0] + dr, old_pos[1] + dc)
+        collision = not (
+            0 <= target[0] < SIZE and 0 <= target[1] < SIZE and target not in WALLS
+        )
+        if not collision:
+            self.pos = target
+        self.t += 1
+
+        reward = -1.0
+        terminated = False
+        truncated = False
+        success = False
+        if collision:
+            reward -= 20.0
+        if self.pos == GOAL:
+            reward += 100.0
+            terminated = True
+            success = True
+        elif is_flooded(self.pos, self.t, self.interval):
+            reward -= 100.0
+            terminated = True
+        elif self.t >= self.max_steps:
+            truncated = True
+
+        if self.reward_mode == "shaped":
+            old_potential = self._potential(old_pos, old_t)
+            new_potential = 0.0 if terminated or truncated else self._potential(self.pos, self.t)
+            reward += 0.99 * new_potential - old_potential
+
+        self.done = terminated or truncated
+        info = {
+            "success": success,
+            "position": self.pos,
+            "time": self.t,
+            "path_length": self.t,
+            "collision": collision,
+            "flooded": terminated and not success,
+        }
+        return self._observation(), reward, terminated, truncated, info
+
+
+def neighbors(pos: tuple[int, int]):
+    for action, (dr, dc) in enumerate(ACTIONS):
+        nxt = (pos[0] + dr, pos[1] + dc)
+        if 0 <= nxt[0] < SIZE and 0 <= nxt[1] < SIZE and nxt not in WALLS:
+            yield action, nxt
+
+
+def search(scenario: str, algorithm: str) -> dict[str, Any]:
+    """Plan in a time-expanded graph with the same flood forecast for both searches."""
+    interval = SCENARIOS[scenario]
+    start_state = (START, 0)
+    frontier: list[tuple[float, int, tuple[tuple[int, int], int]]] = []
+    counter = 0
+    heapq.heappush(frontier, (0.0, counter, start_state))
+    parent: dict[
+        tuple[tuple[int, int], int],
+        tuple[tuple[tuple[int, int], int], int] | None,
+    ] = {start_state: None}
+    cost_so_far = {start_state: 0}
+    expanded = 0
+    began = time.perf_counter()
+    found = None
+
+    while frontier:
+        _, _, state = heapq.heappop(frontier)
+        pos, t = state
+        expanded += 1
+        if pos == GOAL:
+            found = state
+            break
+        if t >= MAX_STEPS:
+            continue
+        for action, nxt in neighbors(pos):
+            next_t = t + 1
+            if is_flooded(nxt, next_t, interval):
+                continue
+            next_state = (nxt, next_t)
+            next_cost = cost_so_far[state] + 1
+            if next_cost >= cost_so_far.get(next_state, math.inf):
+                continue
+            cost_so_far[next_state] = next_cost
+            parent[next_state] = (state, action)
+            priority = next_cost
+            if algorithm == "astar":
+                priority += abs(nxt[0] - GOAL[0]) + abs(nxt[1] - GOAL[1])
+            counter += 1
+            heapq.heappush(frontier, (priority, counter, next_state))
+
+    elapsed = time.perf_counter() - began
+    actions: list[int] = []
+    positions = []
+    if found is not None:
+        cursor = found
+        positions.append(cursor[0])
+        while parent[cursor] is not None:
+            previous, action = parent[cursor]
+            actions.append(action)
+            cursor = previous
+            positions.append(cursor[0])
+        actions.reverse()
+        positions.reverse()
+    return {
+        "algorithm": algorithm.upper(),
+        "scenario": scenario,
+        "actions": actions,
+        "positions": positions,
+        "success": found is not None,
+        "path_length": len(actions) if found is not None else math.nan,
+        "nodes_expanded": expanded,
+        "computation_time": elapsed,
+    }
+
+
+def rollout(env: FloodEscapeEnv, policy, *, seed: int, stochastic: bool = False):
+    observation, _ = env.reset(seed=seed)
+    total_reward = 0.0
+    visited = [env.pos]
+    success = False
+    while True:
+        action = int(policy(env, observation, stochastic))
+        observation, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        visited.append(env.pos)
+        if terminated or truncated:
+            success = info["success"]
+            return {
+                "success": success,
+                "escape_time": env.t if success else math.nan,
+                "path_length": env.t,
+                "cumulative_reward": total_reward,
+                "visited": visited,
+            }
+
+
+def random_policy(env: FloodEscapeEnv, observation, stochastic: bool) -> int:
+    del env, observation, stochastic
+    return random.randrange(len(ACTIONS))
+
+
+def q_state(env: FloodEscapeEnv) -> tuple[int, int, int]:
+    return env.t, env.pos[0], env.pos[1]
+
+
+def train_q(
+    scenario: str,
+    reward_mode: str,
+    episodes: int,
+    seed: int,
+) -> tuple[np.ndarray, list[float], float]:
+    random.seed(seed)
+    np.random.seed(seed)
+    env = FloodEscapeEnv(scenario, reward_mode)
+    q_values = np.zeros((MAX_STEPS + 1, SIZE, SIZE, len(ACTIONS)), dtype=np.float32)
+    returns: list[float] = []
+    began = time.perf_counter()
+    for episode in range(episodes):
+        env.reset()
+        total = 0.0
+        epsilon = max(0.03, 1.0 - episode / max(1, episodes * 0.8))
+        while not env.done:
+            state = q_state(env)
+            if random.random() < epsilon:
+                action = random.randrange(len(ACTIONS))
+            else:
+                best = np.flatnonzero(q_values[state] == q_values[state].max())
+                action = int(np.random.choice(best))
+            _, reward, terminated, truncated, _ = env.step(action)
+            next_state = q_state(env)
+            target = reward
+            if not (terminated or truncated):
+                target += 0.99 * float(np.max(q_values[next_state]))
+            q_values[state + (action,)] += 0.15 * (
+                target - q_values[state + (action,)]
+            )
+            total += reward
+        returns.append(total)
+    return q_values, returns, time.perf_counter() - began
+
+
+def q_policy(q_values: np.ndarray):
+    def policy(env: FloodEscapeEnv, observation, stochastic: bool) -> int:
+        del observation
+        values = q_values[q_state(env)]
+        if stochastic and random.random() < 0.02:
+            return random.randrange(len(ACTIONS))
+        choices = np.flatnonzero(values == values.max())
+        return int(np.random.choice(choices))
+
+    return policy
+
+
+def train_ppo(
+    scenario: str,
+    reward_mode: str,
+    timesteps: int,
+    seed: int,
+):
+    try:
+        import gymnasium as gym
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.callbacks import BaseCallback
+        from stable_baselines3.common.monitor import Monitor
+    except ImportError as exc:
+        raise RuntimeError(
+            "PPO dependencies are missing. Install them with: "
+            "python -m pip install -r requirements.txt"
+        ) from exc
+
+    class GymWrapper(gym.Env):
+        metadata = {"render_modes": []}
+
+        def __init__(self):
+            super().__init__()
+            self.core = FloodEscapeEnv(scenario, reward_mode)
+            self.action_space = gym.spaces.Discrete(len(ACTIONS))
+            self.observation_space = gym.spaces.Box(
+                low=0.0, high=1.0, shape=(3,), dtype=np.float32
+            )
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            observation, info = self.core.reset(seed=seed, options=options)
+            return observation, info
+
+        def step(self, action):
+            return self.core.step(int(action))
+
+    class EpisodeRewardCallback(BaseCallback):
+        def __init__(self):
+            super().__init__()
+            self.episode_returns: list[float] = []
+
+        def _on_step(self) -> bool:
+            for info in self.locals.get("infos", []):
+                if "episode" in info:
+                    self.episode_returns.append(float(info["episode"]["r"]))
+            return True
+
+    env = Monitor(GymWrapper())
+    callback = EpisodeRewardCallback()
+    began = time.perf_counter()
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        n_steps=256,
+        batch_size=64,
+        gamma=0.99,
+        seed=seed,
+        verbose=0,
+        device="cpu",
+    )
+    model.learn(total_timesteps=timesteps, callback=callback, progress_bar=False)
+    elapsed = time.perf_counter() - began
+    env.close()
+    return model, callback.episode_returns, elapsed
+
+
+def evaluate_policy(env: FloodEscapeEnv, policy, episodes: int, stochastic: bool):
+    results = []
+    for episode in range(episodes):
+        random.seed(episode)
+        np.random.seed(episode)
+        results.append(
+            rollout(env, policy, seed=episode, stochastic=stochastic)
+        )
+    successful_times = [r["escape_time"] for r in results if r["success"]]
+    return {
+        "success_rate": sum(r["success"] for r in results) / episodes,
+        "escape_time": float(np.mean(successful_times)) if successful_times else math.nan,
+        "path_length": float(np.mean([r["path_length"] for r in results])),
+        "cumulative_reward": float(np.mean([r["cumulative_reward"] for r in results])),
+    }
+
+
+def save_csv(path: Path, rows: list[dict[str, Any]]):
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_search_experiments() -> list[dict[str, Any]]:
+    rows = []
+    for scenario in SCENARIOS:
+        for algorithm in ("bfs", "astar"):
+            result = search(scenario, algorithm)
+            env = FloodEscapeEnv(scenario, "basic")
+            total_reward = 0.0
+            for action in result["actions"]:
+                _, reward, terminated, truncated, _ = env.step(action)
+                total_reward += reward
+                if terminated or truncated:
+                    break
+            rows.append(
+                {
+                    "algorithm": result["algorithm"],
+                    "scenario": scenario,
+                    "success_rate": float(result["success"]),
+                    "escape_time": result["path_length"] if result["success"] else math.nan,
+                    "path_length": result["path_length"],
+                    "cumulative_reward": total_reward if result["success"] else math.nan,
+                    "nodes_expanded": result["nodes_expanded"],
+                    "computation_time": result["computation_time"],
+                }
+            )
+    return rows
+
+
+def run_rl_experiments(
+    q_episodes: int, ppo_timesteps: int, eval_episodes: int, seed: int
+) -> tuple[list[dict[str, Any]], dict[str, list[float]]]:
+    rows: list[dict[str, Any]] = []
+    curves: dict[str, list[float]] = {}
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    for scenario_index, scenario in enumerate(SCENARIOS):
+        random_started = time.perf_counter()
+        random_metrics = evaluate_policy(
+            FloodEscapeEnv(scenario, "basic"),
+            random_policy,
+            eval_episodes,
+            stochastic=True,
+        )
+        rows.append(
+            {
+                "algorithm": "Random",
+                "scenario": scenario,
+                "reward": "basic",
+                **random_metrics,
+                "nodes_expanded": math.nan,
+                "computation_time": time.perf_counter() - random_started,
+            }
+        )
+        for reward_index, reward_mode in enumerate(REWARDS):
+            model_seed = seed + scenario_index * 10 + reward_index
+
+            q_values, q_curve, q_time = train_q(
+                scenario, reward_mode, q_episodes, model_seed
+            )
+            np.save(MODEL_DIR / f"q_{scenario}_{reward_mode}.npy", q_values)
+            curves[f"Q-Learning {scenario} {reward_mode}"] = q_curve
+            q_metrics = evaluate_policy(
+                FloodEscapeEnv(scenario, reward_mode),
+                q_policy(q_values),
+                eval_episodes,
+                stochastic=False,
+            )
+            rows.append(
+                {
+                    "algorithm": "Q-Learning",
+                    "scenario": scenario,
+                    "reward": reward_mode,
+                    **q_metrics,
+                    "nodes_expanded": math.nan,
+                    "computation_time": q_time,
+                }
+            )
+
+            ppo_model, ppo_curve, ppo_time = train_ppo(
+                scenario, reward_mode, ppo_timesteps, model_seed
+            )
+            ppo_model.save(str(MODEL_DIR / f"ppo_{scenario}_{reward_mode}"))
+            curves[f"PPO {scenario} {reward_mode}"] = ppo_curve
+
+            def policy(env, observation, stochastic, model=ppo_model):
+                del env
+                action, _ = model.predict(observation, deterministic=not stochastic)
+                return int(action)
+
+            ppo_metrics = evaluate_policy(
+                FloodEscapeEnv(scenario, reward_mode),
+                policy,
+                eval_episodes,
+                stochastic=False,
+            )
+            rows.append(
+                {
+                    "algorithm": "PPO",
+                    "scenario": scenario,
+                    "reward": reward_mode,
+                    **ppo_metrics,
+                    "nodes_expanded": math.nan,
+                    "computation_time": ppo_time,
+                }
+            )
+    return rows, curves
+
+
+def draw_grid(ax, scenario: str, t: int = 0, interval: int | None = None):
+    interval = SCENARIOS[scenario] if interval is None else interval
+    grid = np.zeros((SIZE, SIZE, 3), dtype=float)
+    grid[:] = (0.94, 0.94, 0.91)
+    for row, col in WALLS:
+        grid[row, col] = (0.2, 0.2, 0.24)
+    for row in range(SIZE):
+        for col in range(SIZE):
+            if is_flooded((row, col), t, interval):
+                grid[row, col] = (0.2, 0.55, 0.9)
+    ax.imshow(grid)
+    ax.set_xticks(np.arange(-0.5, SIZE, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, SIZE, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1)
+    ax.tick_params(which="both", bottom=False, left=False, labelbottom=False, labelleft=False)
+    ax.scatter([START[1]], [START[0]], marker="o", color="limegreen", s=100, label="START")
+    ax.scatter([GOAL[1]], [GOAL[0]], marker="*", color="gold", edgecolor="black", s=170, label="SAFE")
+    for row, col in FLOOD_SOURCES:
+        ax.scatter([col], [row], marker="X", color="blue", s=80, label="Flood source")
+
+
+def generate_search_plot():
+    bfs = search("normal", "bfs")
+    astar = search("normal", "astar")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    for ax, result in zip(axes, (bfs, astar)):
+        draw_grid(ax, "normal")
+        if result["positions"]:
+            path = result["positions"]
+            ax.plot([p[1] for p in path], [p[0] for p in path], color="crimson", linewidth=2)
+        ax.set_title(
+            f'{result["algorithm"]} (normal flood)\n'
+            f'length={result["path_length"]}, expanded={result["nodes_expanded"]}'
+        )
+        ax.legend(loc="upper left", fontsize=7)
+    fig.tight_layout()
+    fig.savefig(PLOT_DIR / "grid_bfs_astar.png", dpi=160)
+    plt.close(fig)
+
+
+def generate_flood_plot():
+    times = (0, 6, 12, 18)
+    fig, axes = plt.subplots(4, 4, figsize=(10, 10))
+    for row, scenario in enumerate(SCENARIOS):
+        for col, t in enumerate(times):
+            draw_grid(axes[row, col], scenario, t)
+            axes[row, col].set_title(f"{scenario.capitalize()} — t={t}", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(PLOT_DIR / "flood_progression.png", dpi=160)
+    plt.close(fig)
+
+
+def generate_learning_plot(curves: dict[str, list[float]]):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for label, values in curves.items():
+        if not values:
+            continue
+        is_q = label.startswith("Q-Learning")
+        ax = axes[0 if is_q else 1]
+        window = min(50, max(1, len(values) // 20))
+        smoothed = np.convolve(values, np.ones(window) / window, mode="valid")
+        ax.plot(smoothed, label=label.replace("Q-Learning ", "").replace("PPO ", ""))
+    axes[0].set_title("Q-Learning episode return")
+    axes[1].set_title("PPO episode return")
+    for ax in axes:
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Return (smoothed)")
+        ax.legend(fontsize=6, ncol=2)
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(PLOT_DIR / "learning_curves.png", dpi=160)
+    plt.close(fig)
+
+
+def generate_comparison_plots(rows: list[dict[str, Any]]):
+    rl_rows = [r for r in rows if r["algorithm"] in ("Q-Learning", "PPO")]
+    for metric, title, filename in (
+        ("cumulative_reward", "Mean cumulative reward", "reward_comparison.png"),
+        ("success_rate", "Success rate", "success_rate_comparison.png"),
+    ):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        labels = []
+        values = []
+        for scenario in SCENARIOS:
+            for algorithm in ("Q-Learning", "PPO"):
+                for reward in REWARDS:
+                    matching = next(
+                        r for r in rl_rows
+                        if r["scenario"] == scenario
+                        and r["algorithm"] == algorithm
+                        and r["reward"] == reward
+                    )
+                    labels.append(f"{scenario}\n{algorithm}\n{reward}")
+                    values.append(matching[metric])
+        ax.bar(np.arange(len(values)), values, color=[
+            "#4c78a8" if label.endswith("basic") else "#f58518"
+            for label in labels
+        ])
+        ax.set_xticks(np.arange(len(labels)), labels, rotation=45, ha="right", fontsize=7)
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(PLOT_DIR / filename, dpi=160)
+        plt.close(fig)
+
+
+def generate_policy_plot():
+    q_path = MODEL_DIR / "q_normal_shaped.npy"
+    if not q_path.exists():
+        return
+    q_values = np.load(q_path)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    draw_grid(ax, "normal")
+    arrows = ("↑", "↓", "←", "→")
+    for row in range(SIZE):
+        for col in range(SIZE):
+            if (row, col) not in WALLS and (row, col) not in (START, GOAL):
+                action = int(np.argmax(q_values[0, row, col]))
+                ax.text(col, row, arrows[action], ha="center", va="center", color="darkred")
+    ax.set_title("Q-Learning shaped policy at t=0 (normal flood)")
+    ax.legend(loc="upper left", fontsize=7)
+    fig.tight_layout()
+    fig.savefig(PLOT_DIR / "policy_heatmap.png", dpi=160)
+    plt.close(fig)
+
+
+def generate_animation():
+    try:
+        from matplotlib.animation import FuncAnimation, PillowWriter
+    except ImportError as exc:
+        raise RuntimeError("Animation requires Pillow; install requirements.txt.") from exc
+    result = search("normal", "astar")
+    path = result["positions"] or [START]
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    def update(frame):
+        ax.clear()
+        draw_grid(ax, "normal", frame)
+        current = path[min(frame, len(path) - 1)]
+        ax.plot([p[1] for p in path[: frame + 1]], [p[0] for p in path[: frame + 1]],
+                color="crimson", linewidth=2)
+        ax.scatter([current[1]], [current[0]], color="black", s=55, label="Agent")
+        ax.set_title(f"Normal flood escape — timestep {frame}")
+        ax.legend(loc="upper left", fontsize=8)
+
+    animation = FuncAnimation(fig, update, frames=max(len(path), 20), interval=350)
+    animation.save(PLOT_DIR / "flood_escape.gif", writer=PillowWriter(fps=3))
+    plt.close(fig)
+
+
+def generate_all_plots(rows: list[dict[str, Any]], curves: dict[str, list[float]]):
+    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    generate_search_plot()
+    generate_flood_plot()
+    if curves:
+        generate_learning_plot(curves)
+    if any(r["algorithm"] == "Q-Learning" for r in rows):
+        generate_comparison_plots(rows)
+        generate_policy_plot()
+    generate_animation()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("all", "search", "train", "plots", "demo"), default="all")
+    parser.add_argument("--q-episodes", type=int, default=2000)
+    parser.add_argument("--ppo-timesteps", type=int, default=15000)
+    parser.add_argument("--eval-episodes", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=7)
+    args = parser.parse_args()
+    if min(args.q_episodes, args.ppo_timesteps, args.eval_episodes) <= 0:
+        parser.error("episode and timestep counts must be positive")
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    MODEL_DIR.mkdir(exist_ok=True)
+
+    search_rows: list[dict[str, Any]] = []
+    rl_rows: list[dict[str, Any]] = []
+    curves: dict[str, list[float]] = {}
+
+    if args.mode in ("all", "search"):
+        search_rows = run_search_experiments()
+        save_csv(OUTPUT_DIR / "search_results.csv", search_rows)
+        for row in search_rows:
+            print(row)
+    if args.mode in ("all", "train"):
+        rl_rows, curves = run_rl_experiments(
+            args.q_episodes, args.ppo_timesteps, args.eval_episodes, args.seed
+        )
+        save_csv(OUTPUT_DIR / "rl_results.csv", rl_rows)
+        save_csv(
+            OUTPUT_DIR / "learning_curves.csv",
+            [
+                {"series": label, "episode": i + 1, "return": value}
+                for label, values in curves.items()
+                for i, value in enumerate(values)
+            ],
+        )
+        for row in rl_rows:
+            print(row)
+    if args.mode in ("all", "plots"):
+        if args.mode == "plots":
+            search_rows = run_search_experiments()
+            rl_csv = OUTPUT_DIR / "rl_results.csv"
+            if rl_csv.exists():
+                with rl_csv.open(newline="", encoding="utf-8") as file:
+                    rl_rows = list(csv.DictReader(file))
+                for row in rl_rows:
+                    for key in ("success_rate", "escape_time", "path_length",
+                                "cumulative_reward", "nodes_expanded", "computation_time"):
+                        if row.get(key, ""):
+                            row[key] = float(row[key])
+                curve_file = OUTPUT_DIR / "learning_curves.csv"
+                if curve_file.exists():
+                    grouped: dict[str, list[tuple[int, float]]] = {}
+                    with curve_file.open(newline="", encoding="utf-8") as file:
+                        for row in csv.DictReader(file):
+                            grouped.setdefault(row["series"], []).append(
+                                (int(row["episode"]), float(row["return"]))
+                            )
+                    curves = {
+                        label: [value for _, value in sorted(values)]
+                        for label, values in grouped.items()
+                    }
+        generate_all_plots(search_rows + rl_rows, curves)
+    if args.mode == "demo":
+        generate_animation()
+    print(f"Results and figures are in: {OUTPUT_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
